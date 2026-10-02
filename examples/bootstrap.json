@@ -1,0 +1,11 @@
+{
+  "project_root": "D:/path/to/project",
+  "user_authorized": true,
+  "goal": "Build the full project outcome the user approved.",
+  "mvp": "Smallest useful version that proves the project direction.",
+  "completion_criteria": [
+    "The project has implemented the approved MVP.",
+    "Progress documentation is current.",
+    "The agent can identify completed, active, and remaining work."
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "project_root": "D:/path/to/project",
+  "documents": [
+    {
+      "path": "docs/architecture.md",
+      "title": "Architecture",
+      "summary": "Agent-authored architecture notes for the current project.",
+      "tags": ["architecture", "progress"],
+      "content": "# Architecture\n\nAgent-authored notes go here.\n"
+    }
+  ]
+}

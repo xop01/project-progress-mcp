@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "project-progress": {
+      "type": "stdio",
+      "command": "D:/pp-mcp/project-progress-mcp.exe"
+    },
+    "project-progress-dev": {
+      "type": "stdio",
+      "command": "zig",
+      "args": ["build", "run", "--"],
+      "cwd": "D:/path/to/project-progress-mcp"
+    }
+  }
+}

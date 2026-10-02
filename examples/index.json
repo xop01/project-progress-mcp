@@ -1,0 +1,32 @@
+{
+  "project_root": "D:/path/to/project",
+  "sections": [
+    {
+      "section_id": "goal",
+      "heading": "Goal",
+      "level": 2,
+      "status": "current",
+      "summary": "User-approved project goal.",
+      "anchors": ["#goal"]
+    },
+    {
+      "section_id": "next-work",
+      "heading": "Next Work",
+      "level": 2,
+      "status": "active",
+      "summary": "The immediate work the next agent should do.",
+      "anchors": ["#next-work"]
+    }
+  ],
+  "entries": [
+    {
+      "entry_id": "initial-scan",
+      "title": "Initial project scan",
+      "kind": "scan",
+      "status": "done",
+      "priority": 1,
+      "summary": "Agent scanned the existing project and recorded current state.",
+      "details": "Keep this updated if the scan is repeated."
+    }
+  ]
+}

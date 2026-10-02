@@ -1,0 +1,19 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+.project-progress/
+sqlite-download.html
+sqlite-amalgamation-*.zip
+sqlite-amalgamation-*/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.tmp
+*.exe
+*.pdb
+
+# Host-local PowerShell / OS caches must never be committed
+Microsoft/
+**/ModuleAnalysisCache
+**/ModuleAnalysisCache-*
