@@ -41,6 +41,8 @@ try {
     capabilities: {},
     clientInfo: { name: "project-progress-smoke", version: "0.1.0" },
   });
+  const ping = await request("ping", {});
+  assert(ping && typeof ping === "object", "ping did not return a result object");
 
   const tools = await request("tools/list");
   assert(Array.isArray(tools.tools), "tools/list did not return tools");
@@ -171,6 +173,20 @@ try {
   });
   assert(staleIndex.isError, "stale expected_revision was accepted");
 
+  const missingRevision = await callTool("project_progress.index", {
+    project_root: projectRoot,
+    sections: [
+      {
+        section_id: "goal",
+        heading: "Missing revision",
+        summary: "This must not overwrite when expected_revision is omitted.",
+      },
+    ],
+  });
+  assert(missingRevision.isError, "index without expected_revision was accepted after revision 1");
+  const missingRevisionJson = assertJsonText(missingRevision);
+  assert(missingRevisionJson.error === "Conflict", "omitted expected_revision should return Conflict");
+
   const invalidIndex = await callTool("project_progress.index", {
     project_root: projectRoot,
     sections: [
@@ -213,6 +229,13 @@ try {
   });
   assert(!docs.isError, "register_docs failed");
 
+  const devicePath = await callTool("project_progress.register_docs", {
+    project_root: projectRoot,
+    documents: [{ path: "docs/NUL.txt", title: "Device", summary: "must be rejected" }],
+  });
+  assert(devicePath.isError, "Windows device path was accepted");
+  assert(assertJsonText(devicePath).error === "UnsafePath", "device path should be UnsafePath");
+
   const snapshot = await callTool("project_progress.record_snapshot", {
     project_root: projectRoot,
     notes: "Smoke test baseline",
@@ -234,6 +257,15 @@ try {
   const modifiedFileDrift = driftJson.drift.find((item) => item.path === "tracked.txt");
   assert(modifiedFileDrift?.current?.content_hash?.length === 64, "modified drift missing current content hash");
   assert(modifiedFileDrift?.snapshot?.content_hash?.length === 64, "modified drift missing snapshot content hash");
+  await writeFile(join(projectRoot, "large-unhashed.dat"), Buffer.alloc(1024 * 1024 + 1, 7));
+  const largeFileCheck = await callTool("project_progress.session_check", {
+    project_root: projectRoot,
+  });
+  assert(!largeFileCheck.isError, "session_check failed for a file over the hash cap");
+  const largeFileJson = assertJsonText(largeFileCheck);
+  const largeFileDrift = largeFileJson.drift.find((item) => item.path === "large-unhashed.dat");
+  assert(largeFileDrift, "session_check did not report the oversized file");
+  assert(largeFileDrift.current?.content_hash === null, "oversized file should omit content hash");
   assert(driftJson.action_required === "inspect_drift", "drift session_check should require inspection");
   assert(driftJson.can_continue === false, "drift session_check should block unrelated work");
 
@@ -294,6 +326,30 @@ try {
   assert(!largeSnapshot.isError, "record_snapshot failed with large vendor/build trees present");
   const largeSnapshotJson = assertJsonText(largeSnapshot);
   assert(largeSnapshotJson.files_recorded < 50, "record_snapshot hashed too many files despite ignore rules");
+
+  const largeBody = "x".repeat(20 * 1024);
+  const largeIndex = await callTool("project_progress.index", {
+    project_root: projectRoot,
+    expected_revision: 1,
+    full_markdown: `# Project Progress\n\n${largeBody}\n`,
+    sections: [
+      {
+        section_id: "goal",
+        heading: "Goal",
+        summary: "Large newline-delimited payload.",
+      },
+    ],
+  });
+  assert(!largeIndex.isError, `large NDJSON index failed: ${largeIndex.content?.[0]?.text ?? ""}`);
+  assert(assertJsonText(largeIndex).revision === 2, "large index did not advance revision");
+
+  await rm(join(projectRoot, "project_progress.md"));
+  const missingProgress = await callTool("project_progress.session_check", {
+    project_root: projectRoot,
+  });
+  assert(!missingProgress.isError, "session_check failed after progress file removal");
+  const missingProgressJson = assertJsonText(missingProgress);
+  assert(missingProgressJson.markdown_consistency?.matches === false, "deleted progress file should be a consistency mismatch");
 
   const underscoreAlias = await callTool("project_progress_session_check", {
     project_root: projectRoot,

@@ -63,8 +63,10 @@ temporary project afterward.
 
 ## MCP transport
 
-The server speaks JSON-RPC 2.0 over stdio using `Content-Length` framed MCP
-messages.
+The server speaks JSON-RPC 2.0 over stdio. Clients may send one JSON object per
+line or LSP-style `Content-Length` frames. A single message is limited to
+32 MiB; oversized newline-delimited messages are rejected and the process keeps
+running. The server answers `ping`.
 
 On Windows, expose the binary via an NTFS junction so Cursor sees a no-space
 path (Cursor shell-splits spaced `command` paths, and copying under
@@ -146,6 +148,12 @@ Git status is captured with branch information plus explicit `upstream`,
 from remotes; agents should fetch first if they need network-fresh remote state.
 `session_check` is read-only with respect to MCP initialization; if no database
 exists, it returns `mcp_store_initialized: false`.
+`has_snapshot` is true once a snapshot session has been recorded, including a
+snapshot of zero files. `snapshot_file_count` is the number of file rows.
+Unreadable files are skipped instead of failing the check. A directory that
+cannot be entered sets `scan_incomplete` and suppresses deletion drift so
+unseen files are not reported as removed. Files larger than 1 MiB store a null
+content hash and are compared by size and mtime.
 It also returns a structured `action_required` value (`bootstrap_authorization`,
 `scan_project`, `inspect_drift`, `repair_consistency`, or `ready`) and
 `can_continue`, so an agent does not need to infer the session gate from prose.
@@ -166,8 +174,11 @@ future context. Index replacement is transactional.
 Entries may include `entry_id`. Entries with the same `entry_id` are updated in
 place; entries without `entry_id` are appended as history notes.
 The response contains a monotonically increasing `revision`. Pass the revision
-returned by `context` as `expected_revision` when updating an existing project;
-a stale agent receives `Conflict` instead of overwriting newer progress.
+returned by `context` as `expected_revision` when updating an existing project.
+Once the stored revision is greater than zero, `expected_revision` is required.
+A stale or omitted revision receives `Conflict` instead of overwriting newer
+progress. If the database transaction rolls back, the previous
+`project_progress.md` is restored.
 The MCP stores a hash of the root Markdown alongside the revision. `context`
 and `session_check` expose `markdown_consistency` so an interrupted write or
 database failure can be detected.
@@ -182,9 +193,12 @@ Registers documentation files and summaries. When `content` is supplied, the MCP
 writes the documentation file under the project root. Document paths must be
 safe relative paths without absolute roots, drive prefixes, empty segments, `.`,
 or `..`, and `tags` must be an array of strings. Documentation database
-registration is transactional. Before writing content, the MCP resolves the
+registration is transactional. Content files are written before commit, and a
+failed call rolls the new rows back and restores files written during that
+call. Before writing content, the MCP resolves the
 nearest existing parent and rejects symlink/junction paths that escape the
-project root.
+project root. Paths with Windows device names (`NUL`, `CON`, `COM1`, and similar)
+are rejected.
 
 ### `project_progress.record_snapshot`
 

@@ -21,22 +21,21 @@ The MCP is mechanical storage and documentation infrastructure. It speaks framed
 ## Current State
 
 - The Zig server builds and runs on Windows with SQLite amalgamation support.
-- The seven project_progress tools are exposed over MCP stdio.
-- SHA-256 content hashes are stored with file snapshots, catching same-size edits that mtime-only checks can miss.
-- Progress indexing has a monotonic revision and rejects stale expected_revision updates with Conflict.
-- session_check returns action_required and can_continue for bootstrap, scan, drift inspection, consistency repair, or ready states.
-- Markdown consistency hashes detect disagreement between project_progress.md and SQLite metadata.
-- Documentation writes reject lexical traversal and resolved paths that escape the project root.
-- Cursor and Codex desktop configurations point to the compiled server.
-- Scan/snapshot ignores vendor and build trees (`third_party`, `build`, binary extensions, etc.) and caps content hashing at 1 MiB so large SDK trees do not time out MCP calls.
-- Tool failures return structured JSON (`ok`, `error`, `tool`, `message`) and log the same line to stderr.
+- The seven project_progress tools are exposed over MCP stdio, and the server answers ping.
+- Newline-delimited messages are read up to 32 MiB. A single oversized line no longer kills the process on the 8 KiB stdio buffer.
+- SHA-256 content hashes are stored with file snapshots. Files larger than 1 MiB store a null hash and compare by size and mtime.
+- Progress indexing requires expected_revision once the stored revision is greater than zero, and restores project_progress.md if the SQLite transaction rolls back.
+- register_docs writes content before commit and restores those files if the transaction fails.
+- session_check skips unreadable files, suppresses deletion drift when a directory walk is incomplete, and reports a missing progress file as a consistency mismatch.
+- has_snapshot follows a recorded snapshot session, including a snapshot of zero files.
+- Git baselines and recent sessions are ordered by session id.
 - Cursor-style underscore tool names are accepted as aliases for the dotted MCP names.
 - Repo docs/examples avoid host-local absolute paths; preflight rejects common machine-path leaks.
 
 ## Next Work
 
-- Restart the connected Cursor MCP server and reinstall `zig-out/bin/project-progress-mcp.exe` (old process may lock the binary).
-- Optional: honor `.gitignore` / `.project-progress-ignore`, add scan progress watchdog / soft deadline, incremental rehash.
+- Restart the connected Cursor MCP server so it loads the rebuilt binary. zig-out/bin/project-progress-mcp.exe may stay locked by the running process; the audit build is zig-out/audit/bin/project-progress-mcp.exe.
+- Optional: honor .gitignore / .project-progress-ignore, add scan progress watchdog / soft deadline, incremental rehash.
 - Consider optional lifecycle operations for decisions, risks, and project archival.
 
 ## Risks
@@ -44,7 +43,7 @@ The MCP is mechanical storage and documentation infrastructure. It speaks framed
 - ChatGPT web requires a remotely reachable MCP endpoint; a local Windows stdio executable is available to desktop MCP clients only.
 - The MCP stores agent-supplied facts and does not independently verify semantic claims.
 - Until the Cursor MCP child is restarted, the live server may still be the pre-fix binary.
-- Committed docs must stay free of host-local absolute paths; `scripts/preflight.mjs` enforces this.
+- Committed docs must stay free of host-local absolute paths; scripts/preflight.mjs enforces this.
 
 ## Completion Criteria
 
@@ -58,7 +57,8 @@ The MCP is mechanical storage and documentation infrastructure. It speaks framed
 
 ## Change Log
 
-- 2026-08-07: Fixed large-tree session_check/snapshot timeouts by expanding scan skips and capping content hashes; added structured tool errors and underscore tool-name aliases (see `docs/bugs/2026-08-07-large-tree-session-timeout-opaque-errors.md`).
+- 2026-10-04: Stability pass for stdio framing, index/docs transactions, partial scans, snapshot identity, null hashes for large files, and ping.
+- 2026-08-07: Fixed large-tree session_check/snapshot timeouts by expanding scan skips and capping content hashes; added structured tool errors and underscore tool-name aliases (see docs/bugs/2026-08-07-large-tree-session-timeout-opaque-errors.md).
 - 2026-10-02: Scrubbed machine-local absolute paths from docs/comments, removed an accidental host PowerShell cache from the tree, and added a preflight anonymity guard.
 - 2026-08-05: Added SHA-256 file snapshot hashes, progress revisions, structured session actions, Markdown consistency checks, and resolved-path containment checks.
 - 2026-08-05: Added smoke coverage for same-size edits, stale revisions, session gating, hashes, and consistency metadata.

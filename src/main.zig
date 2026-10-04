@@ -9,6 +9,15 @@ const protocol_version = "2024-11-05";
 
 /// Skip full-content hashing above this size; drift then uses size+mtime only.
 const max_content_hash_bytes: u64 = 1 * 1024 * 1024;
+/// Newline-delimited JSON is accumulated until this cap. The stdio reader
+/// buffer is smaller than a real index payload, so lines cannot be taken in
+/// one shot from that buffer.
+const max_message_bytes: usize = 32 * 1024 * 1024;
+const max_tracked_files: usize = 250_000;
+const max_scan_depth: u32 = 64;
+const max_retained_sessions: c_int = 40;
+
+var temp_file_seq: u64 = 0;
 
 var runtime_io: ?std.Io = null;
 var runtime_environ_map: ?*const std.process.Environ.Map = null;
@@ -97,11 +106,24 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         const message = readMessage(allocator, &stdin_reader_file.interface) catch |err| switch (err) {
             error.EndOfStream => break,
-            else => return err,
+            error.MessageTooLarge => {
+                writeJsonRpcError(io, null, -32600, "message exceeds 32MiB limit") catch break;
+                continue;
+            },
+            error.InvalidHeader => {
+                writeJsonRpcError(io, null, -32700, "invalid Content-Length header") catch break;
+                continue;
+            },
+            else => {
+                logToolError(io, "stdio", @errorName(err), "failed to read message");
+                break;
+            },
         };
         defer allocator.free(message);
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch |err| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{
+            .duplicate_field_behavior = .use_last,
+        }) catch |err| {
             try writeJsonRpcError(io, null, -32700, @errorName(err));
             continue;
         };
@@ -113,47 +135,92 @@ pub fn main(init: std.process.Init) !void {
 
 fn readMessage(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     // MCP stdio uses newline-delimited JSON. The server also accepts LSP-style
-    // Content-Length framing for backward-compatible tooling (e.g. the smoke
-    // test in older revisions).
-    var first_line_owned: []u8 = undefined;
-    while (true) {
-        const line_raw = try reader.takeDelimiter('\n') orelse {
-            return error.EndOfStream;
-        };
-        const line = std.mem.trimEnd(u8, line_raw, "\r");
-        if (line.len == 0) continue;
-        first_line_owned = try allocator.dupe(u8, line);
-        break;
-    }
-    errdefer allocator.free(first_line_owned);
-
-    if (first_line_owned[0] == '{' or first_line_owned[0] == '[') {
+    // Content-Length framing. Lines are accumulated so a payload larger than
+    // the stdio buffer (index markdown, document batches) does not kill the
+    // process with StreamTooLong.
+    const first_line_owned = try readNonEmptyLine(allocator, reader) orelse return error.EndOfStream;
+    const first_trimmed = std.mem.trim(u8, first_line_owned, " \t\r");
+    if (first_trimmed.len > 0 and (first_trimmed[0] == '{' or first_trimmed[0] == '[')) {
         return first_line_owned;
     }
+    defer allocator.free(first_line_owned);
 
     var content_length: ?usize = null;
-    if (std.ascii.startsWithIgnoreCase(first_line_owned, "Content-Length:")) {
-        const value = std.mem.trim(u8, first_line_owned["Content-Length:".len..], " \t");
-        content_length = try std.fmt.parseInt(usize, value, 10);
+    if (std.ascii.startsWithIgnoreCase(first_trimmed, "Content-Length:")) {
+        content_length = parseContentLength(first_trimmed) catch return error.FrameTooLarge;
     }
     while (true) {
-        const line_raw = try reader.takeDelimiter('\n') orelse {
-            return error.EndOfStream;
-        };
-        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        const line_owned = try readRawLine(allocator, reader) orelse return error.EndOfStream;
+        defer allocator.free(line_owned);
+        const line = std.mem.trim(u8, line_owned, " \t\r");
         if (line.len == 0) break;
         if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
-            const value = std.mem.trim(u8, line["Content-Length:".len..], " \t");
-            content_length = try std.fmt.parseInt(usize, value, 10);
+            content_length = parseContentLength(line) catch return error.FrameTooLarge;
         }
     }
-    allocator.free(first_line_owned);
 
     const len = content_length orelse return error.InvalidHeader;
+    if (len > max_message_bytes) return error.FrameTooLarge;
     const body = try allocator.alloc(u8, len);
     errdefer allocator.free(body);
     try reader.readSliceAll(body);
     return body;
+}
+
+fn parseContentLength(line: []const u8) !usize {
+    const value = std.mem.trim(u8, line["Content-Length:".len..], " \t");
+    return std.fmt.parseInt(usize, value, 10);
+}
+
+fn readNonEmptyLine(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+    while (true) {
+        const line = try readRawLine(allocator, reader) orelse return null;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) {
+            allocator.free(line);
+            continue;
+        }
+        return line;
+    }
+}
+
+/// Read through the next newline. A line longer than `max_message_bytes` is
+/// discarded through the newline so the stream stays aligned, then
+/// `error.MessageTooLarge` is returned.
+fn readRawLine(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(allocator);
+    var too_long = false;
+    var saw_any = false;
+    while (true) {
+        if (reader.buffered().len == 0) {
+            reader.fill(1) catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (!saw_any) return null;
+                    if (too_long) return error.MessageTooLarge;
+                    return try line.toOwnedSlice(allocator);
+                },
+                else => |read_err| return read_err,
+            };
+        }
+        const buffered = reader.buffered();
+        const newline = std.mem.indexOfScalar(u8, buffered, '\n');
+        const take_len: usize = if (newline) |index| index else buffered.len;
+        saw_any = true;
+        if (!too_long) {
+            if (line.items.len + take_len > max_message_bytes) {
+                too_long = true;
+                line.clearRetainingCapacity();
+            } else if (take_len > 0) {
+                try line.appendSlice(allocator, buffered[0..take_len]);
+            }
+        }
+        if (newline) |index| {
+            reader.toss(index + 1);
+            if (too_long) return error.MessageTooLarge;
+            return try line.toOwnedSlice(allocator);
+        }
+        reader.toss(buffered.len);
+    }
 }
 
 fn handleMessage(allocator: std.mem.Allocator, io: std.Io, value: std.json.Value) !void {
@@ -177,7 +244,15 @@ fn handleMessage(allocator: std.mem.Allocator, io: std.Io, value: std.json.Value
         return;
     }
 
-    if (std.mem.eql(u8, method, "notifications/initialized")) {
+    if (std.mem.eql(u8, method, "notifications/initialized") or
+        std.mem.eql(u8, method, "notifications/cancelled") or
+        std.mem.eql(u8, method, "notifications/progress"))
+    {
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "ping")) {
+        if (id) |request_id| try writeResult(io, request_id, "{}");
         return;
     }
 
@@ -201,9 +276,12 @@ fn handleMessage(allocator: std.mem.Allocator, io: std.Io, value: std.json.Value
                 const detail = toolErrorDetail();
                 const err_name = @errorName(err);
                 logToolError(io, tool, err_name, detail);
-                const text = try formatToolErrorJson(allocator, tool, err_name, detail);
-                defer allocator.free(text);
-                try writeToolText(io, request_id, text, true);
+                if (formatToolErrorJson(allocator, tool, err_name, detail)) |text| {
+                    defer allocator.free(text);
+                    try writeToolText(io, request_id, text, true);
+                } else |_| {
+                    try writeToolText(io, request_id, "{\"ok\":false,\"error\":\"Internal\",\"tool\":\"unknown\",\"message\":\"failed to format tool error\"}", true);
+                }
                 return;
             };
             defer allocator.free(result);
@@ -342,7 +420,7 @@ fn instructionsText() []const u8 {
     \\- Use priority 1 for highest priority, 2 for normal, and 3 for later/nice-to-have.
     \\- Include enough summary/details for the next agent to continue without reading old chat.
     \\- The MCP stores what the agent provides; it does not verify that summaries match the code.
-    \\- Pass context.revision as expected_revision to project_progress.index when updating an existing project. Retry after re-reading context if the MCP returns Conflict.
+    \\- Pass context.revision as expected_revision to project_progress.index when updating an existing project. Once the stored revision is greater than zero, expected_revision is required. Retry after re-reading context if the MCP returns Conflict.
     \\
     \\project_progress.index arguments:
     \\{
@@ -376,10 +454,16 @@ const Db = struct {
         var handle: ?*c.sqlite3 = null;
         const zpath = try std.heap.page_allocator.dupeZ(u8, path);
         defer std.heap.page_allocator.free(zpath);
-        if (c.sqlite3_open(zpath.ptr, &handle) != c.SQLITE_OK) {
+        const rc = c.sqlite3_open(zpath.ptr, &handle);
+        if (rc != c.SQLITE_OK or handle == null) {
+            const detail = if (handle) |opened| std.mem.span(c.sqlite3_errmsg(opened)) else "sqlite open failed";
+            setToolErrorDetail("sqlite open failed: {s}", .{detail});
+            if (handle) |opened| _ = c.sqlite3_close(opened);
             return ToolError.Sqlite;
         }
         if (c.sqlite3_busy_timeout(handle.?, 5000) != c.SQLITE_OK) {
+            const detail = std.mem.span(c.sqlite3_errmsg(handle.?));
+            setToolErrorDetail("sqlite busy timeout failed: {s}", .{detail});
             _ = c.sqlite3_close(handle.?);
             return ToolError.Sqlite;
         }
@@ -387,7 +471,10 @@ const Db = struct {
     }
 
     fn close(self: *Db) void {
-        _ = c.sqlite3_close(self.handle);
+        // Drop WAL/SHM sidecars so a later git status does not flap on files
+        // that only exist while a connection is open.
+        _ = c.sqlite3_wal_checkpoint_v2(self.handle, null, c.SQLITE_CHECKPOINT_TRUNCATE, null, null);
+        _ = c.sqlite3_close_v2(self.handle);
     }
 
     fn exec(self: *Db, sql: []const u8) !void {
@@ -405,11 +492,33 @@ const Db = struct {
         defer std.heap.page_allocator.free(zsql);
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, zsql.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+            const detail = sqliteErrMsg(self);
+            setToolErrorDetail("sqlite prepare failed: {s}", .{detail});
+            if (stmt) |ready| _ = c.sqlite3_finalize(ready);
             return ToolError.Sqlite;
         }
-        return stmt.?;
+        return stmt orelse toolFail(ToolError.Sqlite, "sqlite prepare returned no statement", .{});
     }
 };
+
+fn sqliteErrMsg(db: *Db) []const u8 {
+    const msg = c.sqlite3_errmsg(db.handle);
+    if (msg == null) return "sqlite error";
+    return std.mem.span(msg);
+}
+
+fn execStep(db: *Db, stmt: *c.sqlite3_stmt) !void {
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+        return toolFail(ToolError.Sqlite, "sqlite step failed: {s}", .{sqliteErrMsg(db)});
+    }
+}
+
+fn stepIsRow(db: *Db, stmt: *c.sqlite3_stmt) !bool {
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_ROW) return true;
+    if (rc == c.SQLITE_DONE) return false;
+    return toolFail(ToolError.Sqlite, "sqlite step failed: {s}", .{sqliteErrMsg(db)});
+}
 
 fn ensureProjectStore(allocator: std.mem.Allocator, project_root: []const u8) !Db {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -424,6 +533,7 @@ fn ensureProjectStore(allocator: std.mem.Allocator, project_root: []const u8) !D
     defer allocator.free(db_path);
 
     var db = try Db.open(db_path);
+    errdefer db.close();
     try createSchema(&db);
     return db;
 }
@@ -434,6 +544,7 @@ fn openProjectStoreIfExists(allocator: std.mem.Allocator, project_root: []const 
     if (!fileExists(db_path)) return null;
 
     var db = try Db.open(db_path);
+    errdefer db.close();
     try createSchema(&db);
     return db;
 }
@@ -512,10 +623,31 @@ fn createSchema(db: *Db) !void {
     try ensureColumn(db, "sessions", "git_ahead", "INTEGER DEFAULT 0");
     try ensureColumn(db, "sessions", "git_behind", "INTEGER DEFAULT 0");
     try ensureColumn(db, "file_snapshots", "content_hash", "TEXT");
-    try db.exec(
+    try ensureEntryIdIndex(db);
+}
+
+fn ensureEntryIdIndex(db: *Db) !void {
+    db.exec(
         \\CREATE UNIQUE INDEX IF NOT EXISTS idx_progress_entries_entry_id
         \\  ON progress_entries(entry_id);
-    );
+    ) catch {
+        // A previous process can leave duplicate entry_id rows, which makes
+        // index creation fail and then every later open fail. Keep the newest
+        // row for each id and retry. NULL entry_id history notes stay.
+        try db.exec(
+            \\DELETE FROM progress_entries
+            \\WHERE entry_id IS NOT NULL
+            \\  AND id NOT IN (
+            \\    SELECT MAX(id) FROM progress_entries
+            \\    WHERE entry_id IS NOT NULL
+            \\    GROUP BY entry_id
+            \\  );
+        );
+        try db.exec(
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_progress_entries_entry_id
+            \\  ON progress_entries(entry_id);
+        );
+    };
 }
 
 fn ensureColumn(db: *Db, table: []const u8, column: []const u8, declaration: []const u8) !void {
@@ -524,7 +656,7 @@ fn ensureColumn(db: *Db, table: []const u8, column: []const u8, declaration: []c
 
     const stmt = try db.prepare(pragma);
     defer _ = c.sqlite3_finalize(stmt);
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (try stepIsRow(db, stmt)) {
         if (std.mem.eql(u8, columnText(stmt, 1), column)) return;
     }
 
@@ -537,7 +669,7 @@ fn getMetadata(db: *Db, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     const stmt = try db.prepare("SELECT value FROM metadata WHERE key = ?");
     defer _ = c.sqlite3_finalize(stmt);
     try bindText(stmt, 1, key);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    if (!try stepIsRow(db, stmt)) return null;
     return try allocator.dupe(u8, columnText(stmt, 0));
 }
 
@@ -547,13 +679,17 @@ fn setMetadata(db: *Db, key: []const u8, value: []const u8) !void {
     try bindText(stmt, 1, key);
     try bindText(stmt, 2, value);
     _ = c.sqlite3_bind_int64(stmt, 3, nowUnixSeconds());
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+    try execStep(db, stmt);
 }
 
 fn getRevision(db: *Db, allocator: std.mem.Allocator) !i64 {
     const value = try getMetadata(db, allocator, "progress_revision");
     defer if (value) |text| allocator.free(text);
-    if (value) |text| return std.fmt.parseInt(i64, text, 10) catch 0;
+    if (value) |text| {
+        return std.fmt.parseInt(i64, text, 10) catch {
+            return toolFail(ToolError.Sqlite, "progress_revision is corrupt", .{});
+        };
+    }
     return 0;
 }
 
@@ -575,14 +711,14 @@ fn encodeDigest(digest: [Sha256.digest_length]u8) [Sha256.digest_length * 2]u8 {
 
 fn bootstrap(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
     const authorized = getBool(obj, "user_authorized") orelse false;
-    if (!authorized) return ToolError.Unauthorized;
-    const goal = getString(obj, "goal") orelse return ToolError.MissingArgument;
+    if (!authorized) return toolFail(ToolError.Unauthorized, "user_authorized must be true", .{});
+    const goal = getString(obj, "goal") orelse return toolFail(ToolError.MissingArgument, "missing goal", .{});
     if (isBlank(goal)) return toolFail(ToolError.InvalidRequest, "goal must be non-blank", .{});
-    const mvp = getString(obj, "mvp") orelse return ToolError.MissingArgument;
+    const mvp = getString(obj, "mvp") orelse return toolFail(ToolError.MissingArgument, "missing mvp", .{});
     if (isBlank(mvp)) return toolFail(ToolError.InvalidRequest, "mvp must be non-blank", .{});
-    const completion_value = obj.get("completion_criteria") orelse return ToolError.MissingArgument;
+    const completion_value = obj.get("completion_criteria") orelse return toolFail(ToolError.MissingArgument, "missing completion_criteria", .{});
     try requireNonEmptyStringArray(completion_value);
     const completion_json = try valueToJson(allocator, completion_value);
     defer allocator.free(completion_json);
@@ -596,7 +732,7 @@ fn bootstrap(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     try bindText(stmt, 2, mvp);
     try bindText(stmt, 3, completion_json);
     _ = c.sqlite3_bind_int64(stmt, 4, nowUnixSeconds());
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+    try execStep(&db, stmt);
 
     if (!progressFileExists(allocator, project_root)) {
         const markdown = try renderInitialProgress(allocator, goal, mvp, completion_value);
@@ -609,7 +745,7 @@ fn bootstrap(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
 
 fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
     var db_opt = try openProjectStoreIfExists(allocator, project_root);
     defer if (db_opt) |*db| db.close();
 
@@ -623,8 +759,9 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         for (files.items) |item| allocator.free(item.path);
         files.deinit(allocator);
     }
-    try scanFiles(allocator, project_root, &files);
+    const scan = try scanFiles(allocator, project_root, &files);
     const snapshot_file_count = if (db_opt) |*db| try countFileSnapshots(db) else 0;
+    const has_snapshot = if (db_opt) |*db| try hasSnapshotSession(db) else false;
 
     var current_paths = std.StringHashMap(void).init(allocator);
     defer current_paths.deinit();
@@ -635,6 +772,8 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     var first = true;
     for (files.items) |file| {
         try current_paths.put(file.path, {});
+        if (!file.readable) continue;
+        const current_hash = presentHash(&file.content_hash);
         if (db_opt) |*db| {
             const snap = try loadSnapshot(db, allocator, file.path);
             defer if (snap) |s| allocator.free(s.path);
@@ -642,17 +781,20 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
                 (hashIsPresent(s.content_hash) and !std.mem.eql(u8, &s.content_hash, &file.content_hash)) else true;
             if (changed) {
                 if (snap) |s| {
-                    try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, &file.content_hash, s.size, s.mtime_ns, if (hashIsPresent(s.content_hash)) &s.content_hash else null, "modified_since_snapshot");
+                    try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, current_hash, s.size, s.mtime_ns, presentHash(&s.content_hash), "modified_since_snapshot");
                 } else {
-                    try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, &file.content_hash, null, null, null, "not_in_snapshot");
+                    try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, current_hash, null, null, null, "not_in_snapshot");
                 }
             }
         } else {
-            try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, &file.content_hash, null, null, null, "no_mcp_snapshot");
+            try writeFileDriftItem(&drift.writer, &first, file.path, file.size, file.mtime_ns, current_hash, null, null, null, "no_mcp_snapshot");
         }
     }
     if (db_opt) |*db| {
-        try appendDeletedFileDrift(db, &current_paths, &drift.writer, &first);
+        // A partial walk must not report unseen files as deleted.
+        if (!scan.scan_incomplete) {
+            try appendDeletedFileDrift(db, &current_paths, &drift.writer, &first);
+        }
     }
     try drift.writer.writeAll("]");
 
@@ -665,6 +807,7 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         defer session_drift.deinit();
         try writeSessionDriftJson(&session_drift.writer, git_drift.writer.buffered(), drift.writer.buffered());
         try insertSession(db, "check", git, session_drift.writer.buffered(), "session_check");
+        try pruneSessions(db, "check");
     }
 
     var consistency: ?MarkdownConsistency = null;
@@ -679,7 +822,7 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         "bootstrap_authorization"
     else if (db_opt == null)
         "scan_project"
-    else if (snapshot_file_count == 0)
+    else if (!has_snapshot)
         "scan_project"
     else if (has_git_drift or has_file_drift)
         "inspect_drift"
@@ -694,7 +837,7 @@ fn sessionCheck(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const w = &out.writer;
     try w.writeAll("{\"ok\":true,\"git\":");
     try git.writeJson(w);
-    try w.print(",\"mcp_store_initialized\":{},\"file_count\":{},\"project_empty\":{},\"snapshot_file_count\":{},\"has_snapshot\":{},\"revision\":{}", .{ db_opt != null, files.items.len, files.items.len == 0, snapshot_file_count, snapshot_file_count > 0, revision });
+    try w.print(",\"mcp_store_initialized\":{},\"file_count\":{},\"project_empty\":{},\"snapshot_file_count\":{},\"has_snapshot\":{},\"revision\":{},\"scan_incomplete\":{},\"unreadable_files\":{},\"skipped_directories\":{}", .{ db_opt != null, files.items.len, files.items.len == 0, snapshot_file_count, has_snapshot, revision, scan.scan_incomplete, scan.unreadable_files, scan.skipped_directories });
     try w.writeAll(",\"last_saved_git\":");
     if (saved_git) |state| {
         try state.writeJson(w);
@@ -735,7 +878,7 @@ fn hasJsonItems(json: []const u8) bool {
 
 fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
     var db = try ensureProjectStore(allocator, project_root);
     defer db.close();
 
@@ -744,14 +887,15 @@ fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         return toolFail(ToolError.InvalidRequest, "expected_revision must be an integer", .{});
     if (expected_revision) |revision| if (revision < 0)
         return toolFail(ToolError.InvalidRequest, "expected_revision must be >= 0", .{});
-    const initial_revision = try getRevision(&db, allocator);
-    if (expected_revision) |revision| if (revision != initial_revision)
-        return toolFail(ToolError.Conflict, "expected_revision {d} != actual {d}", .{ revision, initial_revision });
-
     const full_markdown = getString(obj, "full_markdown");
-    const sections = try asArray(obj.get("sections") orelse return ToolError.MissingArgument);
+    const sections = try asArray(obj.get("sections") orelse return toolFail(ToolError.MissingArgument, "missing sections", .{}));
     const entries_value = obj.get("entries");
     try validateIndexPayload(sections, entries_value);
+    const initial_revision = try getRevision(&db, allocator);
+    if (initial_revision > 0 and expected_revision == null)
+        return toolFail(ToolError.Conflict, "expected_revision is required when progress_revision is {d}", .{initial_revision});
+    if (expected_revision) |revision| if (revision != initial_revision)
+        return toolFail(ToolError.Conflict, "expected_revision {d} != actual {d}", .{ revision, initial_revision });
     const rendered_markdown = if (full_markdown == null) try renderIndexedProgress(allocator, sections, entries_value) else null;
     defer if (rendered_markdown) |markdown| allocator.free(markdown);
     const markdown = if (full_markdown) |text| text else rendered_markdown.?;
@@ -760,13 +904,24 @@ fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     try db.exec("BEGIN IMMEDIATE");
     var transaction_open = true;
     errdefer if (transaction_open) db.exec("ROLLBACK") catch {};
+    const progress_path = try projectProgressPath(allocator, project_root);
+    defer allocator.free(progress_path);
+    var previous_markdown: ?[]u8 = null;
+    defer if (previous_markdown) |text| allocator.free(text);
+    var markdown_written = false;
+    errdefer if (markdown_written) restoreFile(progress_path, previous_markdown);
     const transaction_revision = try getRevision(&db, allocator);
+    if (transaction_revision > 0 and expected_revision == null)
+        return toolFail(ToolError.Conflict, "expected_revision is required when progress_revision is {d}", .{transaction_revision});
     if (expected_revision) |revision| if (revision != transaction_revision)
         return toolFail(ToolError.Conflict, "expected_revision {d} != actual {d}", .{ revision, transaction_revision });
     const next_revision = transaction_revision + 1;
     // Hold the SQLite write lock before touching Markdown so a stale agent
     // cannot overwrite a newer progress document before receiving Conflict.
+    // If a later statement fails, restore the previous file before rollback.
+    previous_markdown = try readOptionalFile(allocator, progress_path);
     try writeProjectProgress(allocator, project_root, markdown);
+    markdown_written = true;
     const revision_text = try std.fmt.allocPrint(allocator, "{}", .{next_revision});
     defer allocator.free(revision_text);
     var markdown_hash_text: [Sha256.digest_length * 2]u8 = markdown_hash;
@@ -777,7 +932,10 @@ fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         if (!isStableId(section_id))
             return toolFail(ToolError.InvalidRequest, "section_id must match ^[a-z0-9_-]+$ (got {s})", .{section_id});
         const heading = getString(section_obj, "heading") orelse return ToolError.MissingArgument;
-        const level = getInt(section_obj, "level") orelse 2;
+        const level = if (section_obj.get("level")) |level_value|
+            getValueInteger(level_value) orelse return toolFail(ToolError.InvalidRequest, "section level must be an integer", .{})
+        else
+            2;
         if (level < 1 or level > 6)
             return toolFail(ToolError.InvalidRequest, "section level must be 1..6 (got {d})", .{level});
         const status = getString(section_obj, "status") orelse "current";
@@ -796,7 +954,7 @@ fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         try bindText(stmt, 5, summary);
         try bindText(stmt, 6, anchors_json);
         _ = c.sqlite3_bind_int64(stmt, 7, nowUnixSeconds());
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+        try execStep(&db, stmt);
     }
 
     if (entries_value) |value| {
@@ -811,14 +969,15 @@ fn indexProgress(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
 
     try db.exec("COMMIT");
     transaction_open = false;
+    markdown_written = false;
 
     return std.fmt.allocPrint(allocator, "{{\"ok\":true,\"revision\":{},\"next\":\"Call project_progress.record_snapshot after documentation is current.\"}}", .{next_revision});
 }
 
 fn registerDocs(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
-    const documents = try asArray(obj.get("documents") orelse return ToolError.MissingArgument);
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
+    const documents = try asArray(obj.get("documents") orelse return toolFail(ToolError.MissingArgument, "missing documents", .{}));
     var db = try ensureProjectStore(allocator, project_root);
     defer db.close();
 
@@ -826,13 +985,34 @@ fn registerDocs(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     var transaction_open = true;
     errdefer if (transaction_open) db.exec("ROLLBACK") catch {};
 
+    const DocWrite = struct {
+        path: []u8,
+        previous: ?[]u8,
+    };
+    var doc_writes: std.ArrayList(DocWrite) = .empty;
+    defer {
+        for (doc_writes.items) |item| {
+            allocator.free(item.path);
+            if (item.previous) |text| allocator.free(text);
+        }
+        doc_writes.deinit(allocator);
+    }
+    var docs_written = false;
+    errdefer if (!docs_written) {
+        var index = doc_writes.items.len;
+        while (index > 0) {
+            index -= 1;
+            restoreFile(doc_writes.items[index].path, doc_writes.items[index].previous);
+        }
+    };
+
     for (documents.items) |doc| {
         const doc_obj = try asObject(doc);
-        const path = getString(doc_obj, "path") orelse return ToolError.MissingArgument;
+        const path = getString(doc_obj, "path") orelse return toolFail(ToolError.MissingArgument, "document missing path", .{});
         if (!isSafeRelativePath(path))
             return toolFail(ToolError.UnsafePath, "document path is not a safe relative path: {s}", .{path});
-        const title = getString(doc_obj, "title") orelse return ToolError.MissingArgument;
-        const summary = getString(doc_obj, "summary") orelse return ToolError.MissingArgument;
+        const title = getString(doc_obj, "title") orelse return toolFail(ToolError.MissingArgument, "document missing title", .{});
+        const summary = getString(doc_obj, "summary") orelse return toolFail(ToolError.MissingArgument, "document missing summary", .{});
         const tags_json = try optionalStringArrayToJson(allocator, doc_obj.get("tags"));
         defer allocator.free(tags_json);
         const source_json = try valueToJson(allocator, doc);
@@ -847,35 +1027,40 @@ fn registerDocs(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         try bindText(stmt, 5, source_json);
         _ = c.sqlite3_bind_int64(stmt, 6, nowUnixSeconds());
         _ = c.sqlite3_bind_int64(stmt, 7, nowUnixSeconds());
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+        try execStep(&db, stmt);
     }
-
-    try db.exec("COMMIT");
-    transaction_open = false;
 
     for (documents.items) |doc| {
         const doc_obj = try asObject(doc);
-        const path = getString(doc_obj, "path") orelse return ToolError.MissingArgument;
-        if (!isSafeRelativePath(path))
-            return toolFail(ToolError.UnsafePath, "document path is not a safe relative path: {s}", .{path});
+        const path = getString(doc_obj, "path") orelse return toolFail(ToolError.MissingArgument, "document missing path", .{});
         if (getString(doc_obj, "content")) |content| {
             const target = try std.fs.path.join(allocator, &.{ project_root, path });
-            defer allocator.free(target);
+            errdefer allocator.free(target);
             try verifyContainedWritePath(allocator, project_root, target);
+            const previous = try readOptionalFile(allocator, target);
+            errdefer if (previous) |text| allocator.free(text);
             const io = std.Io.Threaded.global_single_threaded.io();
             const root_dir = try std.Io.Dir.openDirAbsolute(io, project_root, .{});
             defer root_dir.close(io);
             if (relativeParentDir(path)) |dir| try root_dir.createDirPath(io, dir);
             try writeFileAbsolute(target, content);
+            doc_writes.append(allocator, .{ .path = target, .previous = previous }) catch |err| {
+                restoreFile(target, previous);
+                return err;
+            };
         }
     }
+
+    try db.exec("COMMIT");
+    transaction_open = false;
+    docs_written = true;
 
     return allocator.dupe(u8, "{\"ok\":true}");
 }
 
 fn recordSnapshot(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
     const notes = getString(obj, "notes") orelse "";
     var db = try ensureProjectStore(allocator, project_root);
     defer db.close();
@@ -885,13 +1070,37 @@ fn recordSnapshot(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
         for (files.items) |item| allocator.free(item.path);
         files.deinit(allocator);
     }
-    try scanFiles(allocator, project_root, &files);
+    const scan = try scanFiles(allocator, project_root, &files);
     try db.exec("BEGIN IMMEDIATE");
     var transaction_open = true;
     errdefer if (transaction_open) db.exec("ROLLBACK") catch {};
-    try db.exec("DELETE FROM file_snapshots");
+
+    var preserved: std.ArrayList(FileInfo) = .empty;
+    defer {
+        for (preserved.items) |item| allocator.free(item.path);
+        preserved.deinit(allocator);
+    }
+    // An incomplete walk must not drop snapshot rows for directories it could
+    // not enter. A complete walk still keeps the previous row for a file that
+    // exists but could not be read.
+    if (!scan.scan_incomplete) {
+        for (files.items) |file| {
+            if (file.readable) continue;
+            if (try loadSnapshot(&db, allocator, file.path)) |snap| {
+                try preserved.append(allocator, snap);
+            }
+        }
+        try db.exec("DELETE FROM file_snapshots");
+    }
+    var recorded: usize = 0;
     for (files.items) |file| {
+        if (!file.readable) continue;
         try upsertSnapshot(&db, file);
+        recorded += 1;
+    }
+    for (preserved.items) |file| {
+        try upsertSnapshot(&db, file);
+        recorded += 1;
     }
 
     const git = try readGitState(allocator, project_root);
@@ -900,12 +1109,13 @@ fn recordSnapshot(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     defer snapshot_drift.deinit();
     try writeSessionDriftJson(&snapshot_drift.writer, "[]", "[]");
     try insertSession(&db, "snapshot", git, snapshot_drift.writer.buffered(), notes);
+    try pruneSessions(&db, "snapshot");
     try db.exec("COMMIT");
     transaction_open = false;
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try out.writer.print("{{\"ok\":true,\"files_recorded\":{},\"git\":", .{files.items.len});
+    try out.writer.print("{{\"ok\":true,\"files_recorded\":{},\"unreadable_files\":{},\"scan_incomplete\":{},\"git\":", .{ recorded, scan.unreadable_files, scan.scan_incomplete });
     try git.writeJson(&out.writer);
     try out.writer.writeAll("}");
     return out.toOwnedSlice();
@@ -913,7 +1123,7 @@ fn recordSnapshot(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
 
 fn context(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     const obj = try asObject(args);
-    const project_root = getString(obj, "project_root") orelse return ToolError.MissingArgument;
+    const project_root = getString(obj, "project_root") orelse return toolFail(ToolError.MissingArgument, "missing project_root", .{});
     const db_opt = try openProjectStoreIfExists(allocator, project_root);
     if (db_opt == null) {
         return allocator.dupe(u8, "{\"mcp_store_initialized\":false,\"revision\":0,\"goal\":null,\"progress_index\":[],\"progress_entries\":[],\"work_queue\":{\"active\":[],\"blocked\":[],\"next\":[]},\"documentation\":[],\"markdown_consistency\":null,\"latest_check\":null,\"latest_snapshot\":null,\"latest_sessions\":[]}");
@@ -927,28 +1137,28 @@ fn context(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.print("{{\"mcp_store_initialized\":true,\"revision\":{},\"goal\":", .{revision});
-    try appendSingleJsonObject(&db, &out.writer, "SELECT goal, mvp, completion_json, last_updated FROM project_goal WHERE id = 1");
+    try appendSingleJsonObject(allocator, &db, &out.writer, "SELECT goal, mvp, completion_json, last_updated FROM project_goal WHERE id = 1");
     try out.writer.writeAll(",\"progress_index\":");
-    try appendRowsJson(&db, &out.writer, "SELECT section_id, heading, level, status, summary, anchors_json, updated_at FROM progress_index ORDER BY level, section_id");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT section_id, heading, level, status, summary, anchors_json, updated_at FROM progress_index ORDER BY level, section_id");
     try out.writer.writeAll(",\"progress_entries\":");
-    try appendRowsJson(&db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries ORDER BY updated_at DESC LIMIT 20");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries ORDER BY updated_at DESC, id DESC LIMIT 20");
     try out.writer.writeAll(",\"work_queue\":{\"active\":");
-    try appendRowsJson(&db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'active' ORDER BY COALESCE(priority, 2), updated_at DESC LIMIT 10");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'active' ORDER BY COALESCE(priority, 2), updated_at DESC, id DESC LIMIT 10");
     try out.writer.writeAll(",\"blocked\":");
-    try appendRowsJson(&db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'blocked' ORDER BY COALESCE(priority, 2), updated_at DESC LIMIT 10");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'blocked' ORDER BY COALESCE(priority, 2), updated_at DESC, id DESC LIMIT 10");
     try out.writer.writeAll(",\"next\":");
-    try appendRowsJson(&db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'planned' ORDER BY COALESCE(priority, 2), updated_at DESC LIMIT 10");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT entry_id, title, kind, status, priority, summary, details, updated_at FROM progress_entries WHERE status = 'planned' ORDER BY COALESCE(priority, 2), updated_at DESC, id DESC LIMIT 10");
     try out.writer.writeAll("}");
     try out.writer.writeAll(",\"documentation\":");
-    try appendRowsJson(&db, &out.writer, "SELECT path, title, summary, tags_json, source_json, updated_at FROM documentation ORDER BY updated_at DESC LIMIT 50");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT path, title, summary, tags_json, source_json, updated_at FROM documentation ORDER BY updated_at DESC, id DESC LIMIT 50");
     try out.writer.writeAll(",\"markdown_consistency\":");
     try writeMarkdownConsistency(&out.writer, consistency);
     try out.writer.writeAll(",\"latest_check\":");
-    try appendSingleJsonObject(&db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions WHERE session_kind = 'check' ORDER BY started_at DESC, id DESC LIMIT 1");
+    try appendSingleJsonObject(allocator, &db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions WHERE session_kind = 'check' ORDER BY id DESC LIMIT 1");
     try out.writer.writeAll(",\"latest_snapshot\":");
-    try appendSingleJsonObject(&db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions WHERE session_kind = 'snapshot' ORDER BY started_at DESC, id DESC LIMIT 1");
+    try appendSingleJsonObject(allocator, &db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions WHERE session_kind = 'snapshot' ORDER BY id DESC LIMIT 1");
     try out.writer.writeAll(",\"latest_sessions\":");
-    try appendRowsJson(&db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions ORDER BY started_at DESC, id DESC LIMIT 5");
+    try appendRowsJson(allocator, &db, &out.writer, "SELECT session_kind, started_at, git_head, git_branch, git_upstream, git_ahead, git_behind, git_status, drift_json, notes FROM sessions ORDER BY id DESC LIMIT 5");
     try out.writer.writeAll("}");
     return out.toOwnedSlice();
 }
@@ -956,15 +1166,19 @@ fn context(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
 fn insertProgressEntry(db: *Db, entry: std.json.Value) !void {
     const obj = try asObject(entry);
     const entry_id = getString(obj, "entry_id");
-    const title = getString(obj, "title") orelse return ToolError.MissingArgument;
+    if (entry_id) |id| if (isBlank(id)) return toolFail(ToolError.InvalidRequest, "entry_id must be non-blank when provided", .{});
+    const title = getString(obj, "title") orelse return toolFail(ToolError.MissingArgument, "entry missing title", .{});
     const kind = getString(obj, "kind") orelse "";
     const status = getString(obj, "status") orelse return ToolError.MissingArgument;
     if (!isAllowedEntryStatus(status))
         return toolFail(ToolError.InvalidRequest, "invalid entry status: {s}", .{status});
-    const priority = getInt(obj, "priority") orelse 2;
+    const priority = if (obj.get("priority")) |value|
+        getValueInteger(value) orelse return toolFail(ToolError.InvalidRequest, "entry priority must be an integer", .{})
+    else
+        2;
     if (priority < 1 or priority > 3)
         return toolFail(ToolError.InvalidRequest, "entry priority must be 1..3 (got {d})", .{priority});
-    const summary = getString(obj, "summary") orelse return ToolError.MissingArgument;
+    const summary = getString(obj, "summary") orelse return toolFail(ToolError.MissingArgument, "entry missing summary", .{});
     const details = getString(obj, "details") orelse "";
     const stmt = try db.prepare("INSERT INTO progress_entries (entry_id, title, kind, status, priority, summary, details, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(entry_id) DO UPDATE SET title=excluded.title, kind=excluded.kind, status=excluded.status, priority=excluded.priority, summary=excluded.summary, details=excluded.details, updated_at=excluded.updated_at");
     defer _ = c.sqlite3_finalize(stmt);
@@ -977,7 +1191,7 @@ fn insertProgressEntry(db: *Db, entry: std.json.Value) !void {
     try bindText(stmt, 7, details);
     _ = c.sqlite3_bind_int64(stmt, 8, nowUnixSeconds());
     _ = c.sqlite3_bind_int64(stmt, 9, nowUnixSeconds());
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+    try execStep(db, stmt);
 }
 
 fn validateIndexPayload(sections: std.json.Array, entries_value: ?std.json.Value) !void {
@@ -987,7 +1201,10 @@ fn validateIndexPayload(sections: std.json.Array, entries_value: ?std.json.Value
         if (!isStableId(section_id))
             return toolFail(ToolError.InvalidRequest, "section_id must match ^[a-z0-9_-]+$ (got {s})", .{section_id});
         _ = getString(obj, "heading") orelse return ToolError.MissingArgument;
-        const level = getInt(obj, "level") orelse 2;
+        const level = if (obj.get("level")) |level_value|
+            getValueInteger(level_value) orelse return toolFail(ToolError.InvalidRequest, "section level must be an integer", .{})
+        else
+            2;
         if (level < 1 or level > 6)
             return toolFail(ToolError.InvalidRequest, "section level must be 1..6 (got {d})", .{level});
         const status = getString(obj, "status") orelse "current";
@@ -1000,11 +1217,16 @@ fn validateIndexPayload(sections: std.json.Array, entries_value: ?std.json.Value
         const entries = try asArray(value);
         for (entries.items) |entry| {
             const obj = try asObject(entry);
+            if (getString(obj, "entry_id")) |entry_id| if (isBlank(entry_id))
+                return toolFail(ToolError.InvalidRequest, "entry_id must be non-blank when provided", .{});
             _ = getString(obj, "title") orelse return ToolError.MissingArgument;
             const status = getString(obj, "status") orelse return ToolError.MissingArgument;
             if (!isAllowedEntryStatus(status))
                 return toolFail(ToolError.InvalidRequest, "invalid entry status: {s}", .{status});
-            const priority = getInt(obj, "priority") orelse 2;
+            const priority = if (obj.get("priority")) |priority_value|
+                getValueInteger(priority_value) orelse return toolFail(ToolError.InvalidRequest, "entry priority must be an integer", .{})
+            else
+                2;
             if (priority < 1 or priority > 3)
                 return toolFail(ToolError.InvalidRequest, "entry priority must be 1..3 (got {d})", .{priority});
             _ = getString(obj, "summary") orelse return ToolError.MissingArgument;
@@ -1017,6 +1239,13 @@ const FileInfo = struct {
     size: i64,
     mtime_ns: i64,
     content_hash: [Sha256.digest_length * 2]u8,
+    readable: bool = true,
+};
+
+const ScanNotes = struct {
+    unreadable_files: usize = 0,
+    skipped_directories: usize = 0,
+    scan_incomplete: bool = false,
 };
 
 const MarkdownConsistency = struct {
@@ -1043,7 +1272,12 @@ fn getMarkdownConsistency(allocator: std.mem.Allocator, db: *Db, project_root: [
     defer allocator.free(progress_path);
     const current = try readFileHashHex(allocator, progress_path);
     const indexed = try getMetadata(db, allocator, "progress_markdown_hash");
-    const matches = if (current != null and indexed != null) std.mem.eql(u8, current.?, indexed.?) else null;
+    const matches = if (current != null and indexed != null)
+        std.mem.eql(u8, current.?, indexed.?)
+    else if (indexed != null and current == null)
+        false
+    else
+        null;
     return .{ .current = current, .indexed = indexed, .matches = matches };
 }
 
@@ -1063,17 +1297,24 @@ fn writeMarkdownConsistency(writer: anytype, consistency: MarkdownConsistency) !
     try writer.writeAll("}");
 }
 
-fn scanFiles(allocator: std.mem.Allocator, root: []const u8, out: *std.ArrayList(FileInfo)) !void {
+fn scanFiles(allocator: std.mem.Allocator, root: []const u8, out: *std.ArrayList(FileInfo)) !ScanNotes {
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true });
     defer dir.close(io);
-    try scanDir(allocator, root, "", dir, out);
+    var notes = ScanNotes{};
+    try scanDir(allocator, root, "", dir, out, 0, &notes);
+    return notes;
 }
 
-fn scanDir(allocator: std.mem.Allocator, root: []const u8, rel: []const u8, dir: std.Io.Dir, out: *std.ArrayList(FileInfo)) !void {
+fn scanDir(allocator: std.mem.Allocator, root: []const u8, rel: []const u8, dir: std.Io.Dir, out: *std.ArrayList(FileInfo), depth: u32, notes: *ScanNotes) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
+    while (true) {
+        const entry = it.next(io) catch {
+            notes.scan_incomplete = true;
+            notes.skipped_directories += 1;
+            return;
+        } orelse break;
         if (shouldSkipName(entry.name)) continue;
         const rel_path = if (rel.len == 0) try allocator.dupe(u8, entry.name) else try std.fs.path.join(allocator, &.{ rel, entry.name });
         errdefer allocator.free(rel_path);
@@ -1086,29 +1327,87 @@ fn scanDir(allocator: std.mem.Allocator, root: []const u8, rel: []const u8, dir:
                     allocator.free(rel_path);
                     continue;
                 }
-                const file = try std.Io.Dir.openFileAbsolute(io, abs_path, .{});
+                if (out.items.len >= max_tracked_files) {
+                    allocator.free(rel_path);
+                    return toolFail(ToolError.InvalidRequest, "file scan exceeded {d} tracked files", .{max_tracked_files});
+                }
+                const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch {
+                    notes.unreadable_files += 1;
+                    try appendUnreadable(allocator, out, rel_path);
+                    continue;
+                };
                 defer file.close(io);
-                const stat = try file.stat(io);
+                const stat = file.stat(io) catch {
+                    notes.unreadable_files += 1;
+                    try appendUnreadable(allocator, out, rel_path);
+                    continue;
+                };
                 var content_hash: [Sha256.digest_length * 2]u8 = undefined;
                 @memset(&content_hash, 0);
                 if (stat.size <= max_content_hash_bytes) {
-                    content_hash = try hashFile(io, file);
+                    content_hash = hashFile(io, file) catch {
+                        notes.unreadable_files += 1;
+                        try appendUnreadable(allocator, out, rel_path);
+                        continue;
+                    };
                 }
                 try out.append(allocator, .{
                     .path = rel_path,
-                    .size = @intCast(stat.size),
-                    .mtime_ns = @intCast(stat.mtime.nanoseconds),
+                    .size = clampToI64(stat.size),
+                    .mtime_ns = clampToI64(stat.mtime.nanoseconds),
                     .content_hash = content_hash,
+                    .readable = true,
                 });
             },
             .directory => {
-                const child = try std.Io.Dir.openDirAbsolute(io, abs_path, .{ .iterate = true });
+                if (depth >= max_scan_depth) {
+                    notes.scan_incomplete = true;
+                    notes.skipped_directories += 1;
+                    allocator.free(rel_path);
+                    continue;
+                }
+                const child = std.Io.Dir.openDirAbsolute(io, abs_path, .{ .iterate = true }) catch {
+                    notes.scan_incomplete = true;
+                    notes.skipped_directories += 1;
+                    allocator.free(rel_path);
+                    continue;
+                };
                 defer child.close(io);
-                try scanDir(allocator, root, rel_path, child, out);
+                try scanDir(allocator, root, rel_path, child, out, depth + 1, notes);
                 allocator.free(rel_path);
             },
             else => allocator.free(rel_path),
         }
+    }
+}
+
+fn appendUnreadable(allocator: std.mem.Allocator, out: *std.ArrayList(FileInfo), rel_path: []u8) !void {
+    var content_hash: [Sha256.digest_length * 2]u8 = undefined;
+    @memset(&content_hash, 0);
+    try out.append(allocator, .{
+        .path = rel_path,
+        .size = 0,
+        .mtime_ns = 0,
+        .content_hash = content_hash,
+        .readable = false,
+    });
+}
+
+fn clampToI64(value: anytype) i64 {
+    const signedness = @typeInfo(@TypeOf(value)).int.signedness;
+    switch (signedness) {
+        .signed => {
+            const wide: i128 = value;
+            if (wide > std.math.maxInt(i64)) return std.math.maxInt(i64);
+            if (wide < std.math.minInt(i64)) return std.math.minInt(i64);
+            return @intCast(wide);
+        },
+        .unsigned => {
+            const max: u128 = @intCast(std.math.maxInt(i64));
+            const wide: u128 = value;
+            if (wide > max) return std.math.maxInt(i64);
+            return @intCast(wide);
+        },
     }
 }
 
@@ -1186,10 +1485,30 @@ fn isSafeRelativePath(path: []const u8) bool {
             const segment = path[start..i];
             if (segment.len == 0) return false;
             if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+            if (segment[segment.len - 1] == '.' or segment[segment.len - 1] == ' ') return false;
+            if (isWindowsDeviceSegment(segment)) return false;
             start = i + 1;
         }
     }
     return true;
+}
+
+fn isWindowsDeviceSegment(segment: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, segment, '.');
+    const base = if (dot) |index| segment[0..index] else segment;
+    if (base.len == 0) return false;
+    const names = [_][]const u8{ "CON", "PRN", "AUX", "NUL" };
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(base, name)) return true;
+    }
+    if (base.len == 4) {
+        const prefix = base[0..3];
+        const digit = base[3];
+        if ((std.ascii.eqlIgnoreCase(prefix, "COM") or std.ascii.eqlIgnoreCase(prefix, "LPT")) and digit >= '1' and digit <= '9') {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn verifyContainedWritePath(allocator: std.mem.Allocator, project_root: []const u8, target: []const u8) !void {
@@ -1352,25 +1671,30 @@ fn upsertSnapshot(db: *Db, file: FileInfo) !void {
     try bindText(stmt, 1, file.path);
     _ = c.sqlite3_bind_int64(stmt, 2, file.size);
     _ = c.sqlite3_bind_int64(stmt, 3, file.mtime_ns);
-    try bindText(stmt, 4, &file.content_hash);
+    if (hashIsPresent(file.content_hash)) {
+        try bindText(stmt, 4, &file.content_hash);
+    } else if (c.sqlite3_bind_null(stmt, 4) != c.SQLITE_OK) {
+        return toolFail(ToolError.Sqlite, "sqlite bind failed: {s}", .{sqliteErrMsg(db)});
+    }
     _ = c.sqlite3_bind_int64(stmt, 5, nowUnixSeconds());
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+    try execStep(db, stmt);
 }
 
 fn loadSnapshot(db: *Db, allocator: std.mem.Allocator, path: []const u8) !?FileInfo {
     const stmt = try db.prepare("SELECT path, size, mtime_ns, content_hash FROM file_snapshots WHERE path = ?");
     defer _ = c.sqlite3_finalize(stmt);
     try bindText(stmt, 1, path);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    if (!try stepIsRow(db, stmt)) return null;
     var content_hash: [Sha256.digest_length * 2]u8 = undefined;
     @memset(&content_hash, 0);
-    const stored_hash = columnText(stmt, 3);
+    const stored_hash = columnBlob(stmt, 3);
     if (stored_hash.len == content_hash.len) @memcpy(&content_hash, stored_hash);
     return .{
         .path = try allocator.dupe(u8, columnText(stmt, 0)),
         .size = c.sqlite3_column_int64(stmt, 1),
         .mtime_ns = c.sqlite3_column_int64(stmt, 2),
         .content_hash = content_hash,
+        .readable = true,
     };
 }
 
@@ -1378,14 +1702,20 @@ fn hashIsPresent(hash: [Sha256.digest_length * 2]u8) bool {
     return hash[0] != 0;
 }
 
+fn presentHash(hash: *const [Sha256.digest_length * 2]u8) ?[]const u8 {
+    if (!hashIsPresent(hash.*)) return null;
+    return hash;
+}
+
 fn appendDeletedFileDrift(db: *Db, current_paths: *std.StringHashMap(void), writer: anytype, first: *bool) !void {
     const stmt = try db.prepare("SELECT path, size, mtime_ns, content_hash FROM file_snapshots");
     defer _ = c.sqlite3_finalize(stmt);
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (try stepIsRow(db, stmt)) {
         const path = columnText(stmt, 0);
         if (!current_paths.contains(path)) {
-            const stored_hash = columnText(stmt, 3);
-            try writeFileDriftItem(writer, first, path, null, null, null, c.sqlite3_column_int64(stmt, 1), c.sqlite3_column_int64(stmt, 2), if (stored_hash.len > 0) stored_hash else null, "deleted_since_snapshot");
+            const stored_hash = columnBlob(stmt, 3);
+            const snapshot_hash = if (stored_hash.len == Sha256.digest_length * 2 and stored_hash[0] != 0) stored_hash else null;
+            try writeFileDriftItem(writer, first, path, null, null, null, c.sqlite3_column_int64(stmt, 1), c.sqlite3_column_int64(stmt, 2), snapshot_hash, "deleted_since_snapshot");
         }
     }
 }
@@ -1393,8 +1723,14 @@ fn appendDeletedFileDrift(db: *Db, current_paths: *std.StringHashMap(void), writ
 fn countFileSnapshots(db: *Db) !i64 {
     const stmt = try db.prepare("SELECT COUNT(*) FROM file_snapshots");
     defer _ = c.sqlite3_finalize(stmt);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+    if (!try stepIsRow(db, stmt)) return 0;
     return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn hasSnapshotSession(db: *Db) !bool {
+    const stmt = try db.prepare("SELECT 1 FROM sessions WHERE session_kind = 'snapshot' LIMIT 1");
+    defer _ = c.sqlite3_finalize(stmt);
+    return stepIsRow(db, stmt);
 }
 
 fn writeFileDriftItem(writer: anytype, first: *bool, path: []const u8, current_size: ?i64, current_mtime_ns: ?i64, current_hash: ?[]const u8, snapshot_size: ?i64, snapshot_mtime_ns: ?i64, snapshot_hash: ?[]const u8, reason: []const u8) !void {
@@ -1430,9 +1766,9 @@ fn writeFileState(writer: anytype, name: []const u8, size: ?i64, mtime_ns: ?i64,
 }
 
 fn loadLatestGitState(db: *Db, allocator: std.mem.Allocator) !?GitState {
-    const stmt = try db.prepare("SELECT git_head, git_branch, git_upstream, git_ahead, git_behind, git_status FROM sessions WHERE session_kind = 'snapshot' ORDER BY started_at DESC LIMIT 1");
+    const stmt = try db.prepare("SELECT git_head, git_branch, git_upstream, git_ahead, git_behind, git_status FROM sessions WHERE session_kind = 'snapshot' ORDER BY id DESC LIMIT 1");
     defer _ = c.sqlite3_finalize(stmt);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    if (!try stepIsRow(db, stmt)) return null;
     const head = columnText(stmt, 0);
     return .{
         .is_repo = head.len > 0,
@@ -1458,7 +1794,21 @@ fn insertSession(db: *Db, kind: []const u8, git: GitState, drift_json: []const u
     try bindText(stmt, 8, git.status);
     try bindText(stmt, 9, drift_json);
     try bindText(stmt, 10, notes);
-    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return ToolError.Sqlite;
+    try execStep(db, stmt);
+}
+
+fn pruneSessions(db: *Db, kind: []const u8) !void {
+    const stmt = try db.prepare(
+        \\DELETE FROM sessions
+        \\WHERE session_kind = ?1
+        \\  AND id NOT IN (
+        \\    SELECT id FROM sessions WHERE session_kind = ?1 ORDER BY id DESC LIMIT ?
+        \\  )
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, kind);
+    _ = c.sqlite3_bind_int(stmt, 2, max_retained_sessions);
+    try execStep(db, stmt);
 }
 
 fn writeGitDrift(saved: ?GitState, current: GitState, writer: anytype) !void {
@@ -1517,30 +1867,30 @@ fn writeSessionDriftJson(writer: anytype, git_drift: []const u8, file_drift: []c
     try writer.writeAll("}");
 }
 
-fn appendSingleJsonObject(db: *Db, writer: anytype, sql: []const u8) !void {
+fn appendSingleJsonObject(allocator: std.mem.Allocator, db: *Db, writer: anytype, sql: []const u8) !void {
     const stmt = try db.prepare(sql);
     defer _ = c.sqlite3_finalize(stmt);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+    if (!try stepIsRow(db, stmt)) {
         try writer.writeAll("null");
         return;
     }
-    try appendCurrentRowJson(stmt, writer);
+    try appendCurrentRowJson(allocator, stmt, writer);
 }
 
-fn appendRowsJson(db: *Db, writer: anytype, sql: []const u8) !void {
+fn appendRowsJson(allocator: std.mem.Allocator, db: *Db, writer: anytype, sql: []const u8) !void {
     const stmt = try db.prepare(sql);
     defer _ = c.sqlite3_finalize(stmt);
     try writer.writeAll("[");
     var first = true;
-    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+    while (try stepIsRow(db, stmt)) {
         if (!first) try writer.writeAll(",");
         first = false;
-        try appendCurrentRowJson(stmt, writer);
+        try appendCurrentRowJson(allocator, stmt, writer);
     }
     try writer.writeAll("]");
 }
 
-fn appendCurrentRowJson(stmt: *c.sqlite3_stmt, writer: anytype) !void {
+fn appendCurrentRowJson(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, writer: anytype) !void {
     try writer.writeAll("{");
     const count = c.sqlite3_column_count(stmt);
     var i: c_int = 0;
@@ -1555,7 +1905,7 @@ fn appendCurrentRowJson(stmt: *c.sqlite3_stmt, writer: anytype) !void {
             else => {
                 const text = columnText(stmt, i);
                 if (isJsonColumn(name)) {
-                    try writeStoredJson(text, writer);
+                    try writeStoredJson(allocator, text, writer);
                 } else {
                     try std.json.Stringify.value(text, .{}, writer);
                 }
@@ -1569,12 +1919,19 @@ fn isJsonColumn(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "_json");
 }
 
-fn writeStoredJson(text: []const u8, writer: anytype) !void {
+fn writeStoredJson(allocator: std.mem.Allocator, text: []const u8, writer: anytype) !void {
     if (text.len == 0) {
         try writer.writeAll("null");
-    } else {
-        try writer.writeAll(text);
+        return;
     }
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch {
+        try std.json.Stringify.value(text, .{}, writer);
+        return;
+    };
+    defer parsed.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, writer);
 }
 
 fn renderInitialProgress(allocator: std.mem.Allocator, goal: []const u8, mvp: []const u8, completion: ?std.json.Value) ![]u8 {
@@ -1642,7 +1999,11 @@ fn renderIndexedProgress(allocator: std.mem.Allocator, sections: std.json.Array,
 }
 
 fn bindText(stmt: *c.sqlite3_stmt, index: c_int, text: []const u8) !void {
-    if (c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), null) != c.SQLITE_OK) {
+    if (text.len > std.math.maxInt(c_int)) {
+        return toolFail(ToolError.InvalidRequest, "value exceeds sqlite text limit", .{});
+    }
+    const ptr: [*c]const u8 = if (text.len == 0) "" else text.ptr;
+    if (c.sqlite3_bind_text(stmt, index, ptr, @intCast(text.len), null) != c.SQLITE_OK) {
         return ToolError.Sqlite;
     }
 }
@@ -1659,6 +2020,13 @@ fn columnText(stmt: *c.sqlite3_stmt, index: c_int) []const u8 {
     const ptr = c.sqlite3_column_text(stmt, index);
     if (ptr == null) return "";
     return std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
+}
+
+fn columnBlob(stmt: *c.sqlite3_stmt, index: c_int) []const u8 {
+    const n = c.sqlite3_column_bytes(stmt, index);
+    if (n <= 0) return "";
+    const ptr = c.sqlite3_column_blob(stmt, index) orelse return "";
+    return @as([*]const u8, @ptrCast(ptr))[0..@intCast(n)];
 }
 
 fn asObject(value: std.json.Value) !std.json.ObjectMap {
@@ -1685,8 +2053,18 @@ fn getValueString(value: std.json.Value) ?[]const u8 {
 fn getValueInteger(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |integer| integer,
+        .float => |float| integerFromFloat(float),
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
+}
+
+fn integerFromFloat(float: f64) ?i64 {
+    if (!std.math.isFinite(float)) return null;
+    if (float < @as(f64, @floatFromInt(std.math.minInt(i64))) or float > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return null;
+    const as_int: i64 = @intFromFloat(float);
+    if (@as(f64, @floatFromInt(as_int)) != float) return null;
+    return as_int;
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1836,16 +2214,50 @@ fn writeProjectProgress(allocator: std.mem.Allocator, project_root: []const u8, 
 
 fn writeFileAbsolute(path: []const u8, contents: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{}.tmp", .{ path, nowUnixNanoseconds() });
+    temp_file_seq += 1;
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{d}.{d}.tmp", .{ path, nowUnixNanoseconds(), temp_file_seq });
     defer std.heap.page_allocator.free(tmp_path);
+    errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
     {
         const file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
-        errdefer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
         defer file.close(io);
         try file.writeStreamingAll(io, contents);
         try file.sync(io);
     }
 
     try std.Io.Dir.renameAbsolute(tmp_path, path, io);
+}
+
+fn readOptionalFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io);
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var buffer: [16 * 1024]u8 = undefined;
+    var reader_buffer: [8 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &reader_buffer);
+    while (true) {
+        const count = try reader.interface.readSliceShort(&buffer);
+        if (count == 0) break;
+        if (list.items.len + count > max_message_bytes) {
+            return toolFail(ToolError.InvalidRequest, "file exceeds size limit", .{});
+        }
+        try list.appendSlice(allocator, buffer[0..count]);
+        if (count < buffer.len) break;
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn restoreFile(path: []const u8, previous: ?[]const u8) void {
+    if (previous) |contents| {
+        writeFileAbsolute(path, contents) catch {};
+    } else {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    }
 }
